@@ -138,13 +138,12 @@ add_subdirectory_ifdef(CONFIG_TMD2620       tmd2620)
 add_subdirectory_ifdef(CONFIG_NTC_THERMISTOR ntc_thermistor)
 add_subdirectory_ifdef(CONFIG_S11059            s11059)
 
-if(CONFIG_USERSPACE OR CONFIG_SENSOR_SHELL OR CONFIG_SENSOR_SHELL_BATTERY)
+if(CONFIG_USERSPACE OR CONFIG_SENSOR_SHELL OR CONFIG_SENSOR_SHELL_BATTERY OR CONFIG_SENSOR_ASYNC_API)
 # The above if() is needed or else CMake would complain about
 # empty library.
-
 zephyr_library()
+zephyr_library_sources_ifdef(CONFIG_SENSOR_ASYNC_API sensor_decoders_init.c default_rtio_sensor.c)
 zephyr_library_sources_ifdef(CONFIG_USERSPACE sensor_handlers.c)
 zephyr_library_sources_ifdef(CONFIG_SENSOR_SHELL sensor_shell.c)
 zephyr_library_sources_ifdef(CONFIG_SENSOR_SHELL_BATTERY shell_battery.c)
-
 endif()
