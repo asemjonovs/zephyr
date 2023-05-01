@@ -18,6 +18,11 @@
 	"when no channels are provided. Syntax:\n"                                                 \
 	"<device_name> <channel name 0> .. <channel name N>"
 
+#define SENSOR_STREAM_HELP                                                                         \
+	"Start/stop streaming sensor data. Data ready trigger will be used if no triggers "        \
+	"are provided. Syntax:\n"                                                                  \
+	"<device_name> on|off <trigger name 0> .. <trigger name N>"
+
 #define SENSOR_ATTR_GET_HELP                                                                       \
 	"Get the sensor's channel attribute. Syntax:\n"                                            \
 	"<device_name> [<channel_name 0> <attribute_name 0> .. "                                   \
@@ -107,10 +112,26 @@ static const char *sensor_attribute_name[SENSOR_ATTR_COMMON_COUNT] = {
 	[SENSOR_ATTR_FF_DUR] = "ff_dur",
 };
 
+static const char *sensor_trigger_type_name[SENSOR_TRIG_COMMON_COUNT] = {
+	[SENSOR_TRIG_TIMER] = "timer",
+	[SENSOR_TRIG_DATA_READY] = "data_ready",
+	[SENSOR_TRIG_DELTA] = "delta",
+	[SENSOR_TRIG_NEAR_FAR] = "near_far",
+	[SENSOR_TRIG_THRESHOLD] = "threshold",
+	[SENSOR_TRIG_TAP] = "tap",
+	[SENSOR_TRIG_DOUBLE_TAP] = "double_tap",
+	[SENSOR_TRIG_FREEFALL] = "freefall",
+	[SENSOR_TRIG_MOTION] = "motion",
+	[SENSOR_TRIG_STATIONARY] = "stationary",
+	[SENSOR_TRIG_FIFO_THRESHOLD] = "fifo_thres",
+	[SENSOR_TRIG_FIFO_FULL] = "fifo_full",
+};
+
 enum dynamic_command_context {
 	NONE,
 	CTX_GET,
 	CTX_ATTR_GET_SET,
+	CTX_STREAM_ON_OFF,
 };
 
 static enum dynamic_command_context current_cmd_ctx = NONE;
@@ -119,11 +140,24 @@ static enum dynamic_command_context current_cmd_ctx = NONE;
 static enum sensor_channel iodev_sensor_shell_channels[SENSOR_CHAN_ALL];
 static struct sensor_read_config iodev_sensor_shell_read_config = {
 	.sensor = NULL,
+	.is_streaming = false,
 	.channels = iodev_sensor_shell_channels,
 	.count = 0,
 	.max = ARRAY_SIZE(iodev_sensor_shell_channels),
 };
 RTIO_IODEV_DEFINE(iodev_sensor_shell_read, &__sensor_iodev_api, &iodev_sensor_shell_read_config);
+
+/* Create a single common config for streaming */
+static enum sensor_trigger_type iodev_sensor_shell_trigger_types[SENSOR_TRIG_COMMON_COUNT];
+static struct sensor_read_config iodev_sensor_shell_stream_config = {
+	.sensor = NULL,
+	.is_streaming = true,
+	.triggers = iodev_sensor_shell_trigger_types,
+	.count = 0,
+	.max = ARRAY_SIZE(iodev_sensor_shell_trigger_types),
+};
+RTIO_IODEV_DEFINE(iodev_sensor_shell_stream, &__sensor_iodev_api,
+		  &iodev_sensor_shell_stream_config);
 
 /* Create the RTIO context to service the reading */
 RTIO_DEFINE_WITH_MEMPOOL(sensor_read_rtio, 8, 8, 32, 64, 4);
@@ -259,6 +293,7 @@ static void sensor_shell_processing_callback(int result, uint8_t *buf, uint32_t 
 
 static int cmd_get_sensor(const struct shell *sh, size_t argc, char *argv[])
 {
+	static struct sensor_shell_processing_context ctx;
 	const struct device *dev;
 	int err;
 
@@ -302,10 +337,8 @@ static int cmd_get_sensor(const struct shell *sh, size_t argc, char *argv[])
 	}
 	iodev_sensor_shell_read_config.sensor = dev;
 
-	struct sensor_shell_processing_context ctx = {
-		.dev = dev,
-		.sh = sh,
-	};
+	ctx.dev = dev;
+	ctx.sh = sh;
 	err = sensor_read(&iodev_sensor_shell_read, &sensor_read_rtio, &ctx);
 	if (err < 0) {
 		shell_error(sh, "Failed to read sensor: %d", err);
@@ -314,6 +347,20 @@ static int cmd_get_sensor(const struct shell *sh, size_t argc, char *argv[])
 
 	return 0;
 }
+
+static void sensor_shell_processing_entry_point(void *a, void *b, void *c)
+{
+	ARG_UNUSED(a);
+	ARG_UNUSED(b);
+	ARG_UNUSED(c);
+
+	while (true) {
+		sensor_processing_with_callback(&sensor_read_rtio,
+						sensor_shell_processing_callback);
+	}
+}
+K_THREAD_DEFINE(sensor_shell_processing_tid, CONFIG_SENSOR_SHELL_THREAD_STACK_SIZE,
+		sensor_shell_processing_entry_point, NULL, NULL, NULL, 0, 0, 0);
 
 static int cmd_sensor_attr_set(const struct shell *shell_ptr, size_t argc, char *argv[])
 {
@@ -424,29 +471,66 @@ static int cmd_sensor_attr_get(const struct shell *shell_ptr, size_t argc, char 
 	return 0;
 }
 
-static void channel_name_get(size_t idx, struct shell_static_entry *entry);
-
-SHELL_DYNAMIC_CMD_CREATE(dsub_channel_name, channel_name_get);
-
-static void attribute_name_get(size_t idx, struct shell_static_entry *entry)
+static int cmd_sensor_stream(const struct shell *shell_ptr, size_t argc, char *argv[])
 {
-	int cnt = 0;
+	static struct rtio_sqe *current_streaming_handle;
+	static struct sensor_shell_processing_context ctx;
+	const struct device *dev = device_get_binding(argv[1]);
 
-	entry->syntax = NULL;
-	entry->handler = NULL;
-	entry->help = NULL;
-	entry->subcmd = &dsub_channel_name;
+	if (dev == NULL) {
+		shell_error(shell_ptr, "Device unknown (%s)", argv[1]);
+		return -ENODEV;
+	}
 
-	for (int i = 0; i < SENSOR_ATTR_COMMON_COUNT; i++) {
-		if (sensor_attribute_name[i] != NULL) {
-			if (cnt == idx) {
-				entry->syntax = sensor_attribute_name[i];
-				break;
+	if (current_streaming_handle != NULL) {
+		shell_print(shell_ptr, "Disabling existing stream");
+		rtio_sqe_cancel(current_streaming_handle);
+	}
+
+	if (strcmp("off", argv[2]) == 0) {
+		return 0;
+	}
+
+	if (strcmp("on", argv[2]) != 0) {
+		shell_error(shell_ptr, "Unknown streaming operation (%s)", argv[2]);
+		return -EINVAL;
+	}
+
+	shell_print(shell_ptr, "Enabling stream...");
+	iodev_sensor_shell_stream_config.sensor = dev;
+	if (argc == 3) {
+		iodev_sensor_shell_stream_config.count = 1;
+		iodev_sensor_shell_trigger_types[0] = SENSOR_TRIG_DATA_READY;
+	} else {
+		iodev_sensor_shell_stream_config.count = argc - 3;
+		for (int i = 3; i < argc; ++i) {
+			int trigger = parse_named_int(argv[i], sensor_trigger_type_name,
+						      ARRAY_SIZE(sensor_trigger_type_name));
+
+			if (trigger < 0) {
+				shell_error(shell_ptr, "Invalid trigger (%s)", argv[i]);
+				return -EINVAL;
 			}
-			cnt++;
+			iodev_sensor_shell_trigger_types[i - 3] = trigger;
 		}
 	}
+
+	ctx.dev = dev;
+	ctx.sh = shell_ptr;
+
+	int rc = sensor_stream(&iodev_sensor_shell_stream, &sensor_read_rtio, &ctx,
+			       &current_streaming_handle);
+
+	if (rc != 0) {
+		shell_error(shell_ptr, "Failed to start stream");
+	}
+	return rc;
 }
+
+static void channel_name_get(size_t idx, struct shell_static_entry *entry);
+SHELL_DYNAMIC_CMD_CREATE(dsub_channel_name, channel_name_get);
+
+static void attribute_name_get(size_t idx, struct shell_static_entry *entry);
 SHELL_DYNAMIC_CMD_CREATE(dsub_attribute_name, attribute_name_get);
 
 static void channel_name_get(size_t idx, struct shell_static_entry *entry)
@@ -475,6 +559,65 @@ static void channel_name_get(size_t idx, struct shell_static_entry *entry)
 	}
 }
 
+static void attribute_name_get(size_t idx, struct shell_static_entry *entry)
+{
+	int cnt = 0;
+
+	entry->syntax = NULL;
+	entry->handler = NULL;
+	entry->help = NULL;
+	entry->subcmd = &dsub_channel_name;
+
+	for (int i = 0; i < SENSOR_ATTR_COMMON_COUNT; i++) {
+		if (sensor_attribute_name[i] != NULL) {
+			if (cnt == idx) {
+				entry->syntax = sensor_attribute_name[i];
+				break;
+			}
+			cnt++;
+		}
+	}
+}
+
+
+static void trigger_name_get(size_t idx, struct shell_static_entry *entry);
+SHELL_DYNAMIC_CMD_CREATE(dsub_trigger_name, trigger_name_get);
+static void trigger_name_get(size_t idx, struct shell_static_entry *entry)
+{
+	int cnt = 0;
+
+	entry->syntax = NULL;
+	entry->handler = NULL;
+	entry->help = NULL;
+	entry->subcmd = &dsub_trigger_name;
+
+	for (int i = 0; i < SENSOR_TRIG_COMMON_COUNT; i++) {
+		if (sensor_trigger_type_name[i] != NULL) {
+			if (cnt == idx) {
+				entry->syntax = sensor_trigger_type_name[i];
+				break;
+			}
+			cnt++;
+		}
+	}
+}
+
+static void stream_on_off(size_t idx, struct shell_static_entry *entry)
+{
+	entry->syntax = NULL;
+	entry->handler = NULL;
+	entry->help = NULL;
+
+	if (idx == 0) {
+		entry->syntax = "on";
+		entry->subcmd = &dsub_trigger_name;
+	} else if (idx == 1) {
+		entry->syntax = "off";
+		entry->subcmd = NULL;
+	}
+}
+SHELL_DYNAMIC_CMD_CREATE(dsub_stream_on_off, stream_on_off);
+
 static void device_name_get(size_t idx, struct shell_static_entry *entry);
 
 SHELL_DYNAMIC_CMD_CREATE(dsub_device_name, device_name_get);
@@ -501,6 +644,18 @@ static void device_name_get_for_attr(size_t idx, struct shell_static_entry *entr
 	entry->subcmd = &dsub_channel_name;
 }
 SHELL_DYNAMIC_CMD_CREATE(dsub_device_name_for_attr, device_name_get_for_attr);
+
+static void device_name_get_for_trig(size_t idx, struct shell_static_entry *entry)
+{
+	const struct device *dev = shell_device_lookup(idx, NULL);
+
+	current_cmd_ctx = CTX_STREAM_ON_OFF;
+	entry->syntax = (dev != NULL) ? dev->name : NULL;
+	entry->handler = NULL;
+	entry->help = NULL;
+	entry->subcmd = &dsub_stream_on_off;
+}
+SHELL_DYNAMIC_CMD_CREATE(dsub_device_name_for_trig, device_name_get_for_trig);
 
 static int cmd_get_sensor_info(const struct shell *sh, size_t argc, char **argv)
 {
@@ -533,6 +688,8 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_sensor,
 			cmd_sensor_attr_set, 2, 255),
 	SHELL_CMD_ARG(attr_get, &dsub_device_name_for_attr, SENSOR_ATTR_GET_HELP,
 			cmd_sensor_attr_get, 2, 255),
+	SHELL_CMD_ARG(stream, &dsub_device_name_for_trig, SENSOR_STREAM_HELP,
+			cmd_sensor_stream, 2, 255),
 	SHELL_COND_CMD(CONFIG_SENSOR_INFO, info, NULL, SENSOR_INFO_HELP,
 			cmd_get_sensor_info),
 	SHELL_SUBCMD_SET_END
