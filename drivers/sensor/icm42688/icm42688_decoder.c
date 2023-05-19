@@ -8,30 +8,39 @@
 #include "icm42688.h"
 #include <errno.h>
 
+#include <zephyr/sys/util.h>
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(ICM42688_DECODER, CONFIG_SENSOR_LOG_LEVEL);
 
 #define DT_DRV_COMPAT invensense_icm42688
+#define TEMP_SHIFT_VAL 8
 
-int icm42688_get_shift(enum sensor_channel chan)
+static inline int8_t icm42688_decoder_get_accel_shift(enum icm42688_accel_fs accel_fs)
 {
-	/* TODO: May need fine tuning */
-	switch (chan) {
-	case SENSOR_CHAN_ACCEL_XYZ:
-	case SENSOR_CHAN_ACCEL_X:
-	case SENSOR_CHAN_ACCEL_Y:
-	case SENSOR_CHAN_ACCEL_Z:
-		return 16;
-	case SENSOR_CHAN_GYRO_XYZ:
-	case SENSOR_CHAN_GYRO_X:
-	case SENSOR_CHAN_GYRO_Y:
-	case SENSOR_CHAN_GYRO_Z:
-		return 16;
-	case SENSOR_CHAN_DIE_TEMP:
-		return 16;
-	default:
-		return -ENOTSUP;
-	}
+	static const int8_t accel_fs_to_shift[] = {
+		4, /* ICM42688_ACCEL_FS_16G */
+		3, /* ICM42688_ACCEL_FS_8G  */
+		2, /* ICM42688_ACCEL_FS_4G  */
+		1, /* ICM42688_ACCEL_FS_2G  */
+	};
+
+	return (accel_fs <= ICM42688_ACCEL_FS_2G ? accel_fs_to_shift[accel_fs] : -EINVAL);
+}
+
+static inline int8_t icm42688_decoder_get_gyro_shift(enum icm42688_gyro_fs gyro_fs)
+{
+	static const int8_t gyro_fs_to_shift[] = {
+		11, /* ICM42688_GYRO_FS_2000   */
+		10, /* ICM42688_GYRO_FS_1000   */
+		9,  /* ICM42688_GYRO_FS_500    */
+		8,  /* ICM42688_GYRO_FS_250    */
+		7,  /* ICM42688_GYRO_FS_125    */
+		6,  /* ICM42688_GYRO_FS_62_5   */
+		5,  /* ICM42688_GYRO_FS_31_25  */
+		4,  /* ICM42688_GYRO_FS_15_625 */
+	};
+
+	return (gyro_fs <= ICM42688_GYRO_FS_15_625 ? gyro_fs_to_shift[gyro_fs] : -EINVAL);
 }
 
 int icm42688_convert_raw_to_q31(struct icm42688_cfg *cfg, enum sensor_channel chan,
@@ -39,6 +48,7 @@ int icm42688_convert_raw_to_q31(struct icm42688_cfg *cfg, enum sensor_channel ch
 {
 	int32_t whole;
 	uint32_t fraction;
+	uint32_t w_mask, f_mask;
 
 	switch (chan) {
 	case SENSOR_CHAN_ACCEL_XYZ:
@@ -46,18 +56,24 @@ int icm42688_convert_raw_to_q31(struct icm42688_cfg *cfg, enum sensor_channel ch
 	case SENSOR_CHAN_ACCEL_Y:
 	case SENSOR_CHAN_ACCEL_Z:
 		icm42688_accel_ms(cfg, reading, &whole, &fraction);
-		*out = (whole << icm42688_get_shift(chan)) | fraction;
+		w_mask = GENMASK(31, 31 - icm42688_decoder_get_accel_shift(cfg->accel_fs));
+		f_mask = ~w_mask;
+		*out = FIELD_PREP(w_mask, whole) | FIELD_PREP(f_mask, fraction);
 		break;
 	case SENSOR_CHAN_GYRO_XYZ:
 	case SENSOR_CHAN_GYRO_X:
 	case SENSOR_CHAN_GYRO_Y:
 	case SENSOR_CHAN_GYRO_Z:
 		icm42688_gyro_rads(cfg, reading, &whole, &fraction);
-		*out = (whole << icm42688_get_shift(chan)) | fraction;
+		w_mask = GENMASK(31, 31 - icm42688_decoder_get_gyro_shift(cfg->gyro_fs));
+		f_mask = ~w_mask;
+		*out = FIELD_PREP(w_mask, whole) | FIELD_PREP(f_mask, fraction);
 		break;
 	case SENSOR_CHAN_DIE_TEMP:
 		icm42688_temp_c(reading, &whole, &fraction);
-		*out = (whole << icm42688_get_shift(chan)) | fraction;
+		w_mask = GENMASK(31, 31 - TEMP_SHIFT_VAL);
+		f_mask = ~w_mask;
+		*out = FIELD_PREP(w_mask, whole) | FIELD_PREP(f_mask, fraction);
 		break;
 	default:
 		return -ENOTSUP;
@@ -136,20 +152,6 @@ int icm42688_encode(const struct device *dev, const enum sensor_channel *const c
 	return 0;
 }
 
-static int calc_num_samples(uint8_t channels_read)
-{
-	int chan;
-	int num_samples = 0;
-
-	while (channels_read) {
-		chan = __builtin_ctz(channels_read);
-		num_samples += SENSOR_CHANNEL_3_AXIS(chan) ? 3 : 1;
-		channels_read &= ~BIT(chan);
-	}
-
-	return num_samples;
-}
-
 static int icm42688_decoder_decode(const uint8_t *buffer, sensor_frame_iterator_t *fit,
 				   sensor_channel_iterator_t *cit, enum sensor_channel *channels,
 				   q31_t *values, uint8_t max_count)
@@ -223,56 +225,16 @@ static int icm42688_decoder_get_shift(const uint8_t *buffer, enum sensor_channel
 	case SENSOR_CHAN_ACCEL_X:
 	case SENSOR_CHAN_ACCEL_Y:
 	case SENSOR_CHAN_ACCEL_Z:
-		switch (edata->accelerometer_scale) {
-		case ICM42688_ACCEL_FS_2G:
-			*shift = 1;
-			return 0;
-		case ICM42688_ACCEL_FS_4G:
-			*shift = 2;
-			return 0;
-		case ICM42688_ACCEL_FS_8G:
-			*shift = 3;
-			return 0;
-		case ICM42688_ACCEL_FS_16G:
-			*shift = 4;
-			return 0;
-		default:
-			return -EINVAL;
-		}
+		*shift = icm42688_decoder_get_accel_shift(edata->accelerometer_scale);
+		return 0;
 	case SENSOR_CHAN_GYRO_XYZ:
 	case SENSOR_CHAN_GYRO_X:
 	case SENSOR_CHAN_GYRO_Y:
 	case SENSOR_CHAN_GYRO_Z:
-		switch (edata->gyroscope_scale) {
-		case ICM42688_GYRO_FS_15_625:
-			*shift = 4;
-			return 0;
-		case ICM42688_GYRO_FS_31_25:
-			*shift = 5;
-			return 0;
-		case ICM42688_GYRO_FS_62_5:
-			*shift = 6;
-			return 0;
-		case ICM42688_GYRO_FS_125:
-			*shift = 7;
-			return 0;
-		case ICM42688_GYRO_FS_250:
-			*shift = 8;
-			return 0;
-		case ICM42688_GYRO_FS_500:
-			*shift = 9;
-			return 0;
-		case ICM42688_GYRO_FS_1000:
-			*shift = 10;
-			return 0;
-		case ICM42688_GYRO_FS_2000:
-			*shift = 11;
-			return 0;
-		default:
-			return -EINVAL;
-		}
+		*shift = icm42688_decoder_get_gyro_shift(edata->gyroscope_scale);
+		return 0;
 	case SENSOR_CHAN_DIE_TEMP:
-		*shift = 0;
+		*shift = TEMP_SHIFT_VAL;
 		return 0;
 	default:
 		return -EINVAL;

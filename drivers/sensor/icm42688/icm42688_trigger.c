@@ -153,7 +153,7 @@ int icm42688_trigger_enable_interrupt(const struct device *dev, struct icm42688_
 {
 	int res;
 	const struct icm42688_dev_cfg *cfg = dev->config;
-	struct icm42688_sensor_data *data = dev->data;
+	//struct icm42688_sensor_data *data = dev->data;
 
 	/* pulse-mode (auto clearing), push-pull and active-high */
 	res = icm42688_spi_single_write(&cfg->spi, REG_INT_CONFIG,
